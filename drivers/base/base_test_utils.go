@@ -25,7 +25,7 @@ func VerifyIcebergSync(t *testing.T, tableName string, expectedCount int, messag
 	time.Sleep(15 * time.Second)
 
 	// Connect to Spark - use localhost instead of container hostname
-	var sparkConnectAddress = "sc://spark-iceberg:15002" // Default value
+	var sparkConnectAddress = "sc://localhost:15002" // Default value
 
 	// Add retries for spark connection
 	var spark sql.SparkSession
