@@ -21,21 +21,59 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/readconcern"
 )
 
-func (m *Mongo) backfill(backfillCtx context.Context, pool *protocol.WriterPool, stream protocol.Stream) error {
+func (m *Mongo) backfill(ctx context.Context, pool *protocol.WriterPool, stream protocol.Stream) error {
+	return base.ProcessBackfill(
+		ctx,
+		pool,
+		stream,
+		m.fetchChunks,
+		m.iterateChunk, // Database-specific iterator
+		m.cleanChunk,   // Database-specific cleanup
+		m.config.RetryCount,
+	)
+}
+
+func (m *Mongo) iterateChunk(ctx context.Context, chunk types.Chunk, stream protocol.Stream, insert func(types.RawRecord) error) error {
+	collection := m.client.Database(stream.Namespace(), options.Database().SetReadConcern(readconcern.Majority())).Collection(stream.Name())
+	cursor, err := collection.Aggregate(ctx, generatePipeline(chunk.Min, chunk.Max))
+	if err != nil {
+		return err
+	}
+	defer cursor.Close(ctx)
+
+	for cursor.Next(ctx) {
+		var doc bson.M
+		if err := cursor.Decode(&doc); err != nil {
+			return err
+		}
+		handleMongoObject(doc)
+		if err := insert(types.CreateRawRecord(utils.GetKeysHash(doc, constants.MongoPrimaryID), doc, "r", time.Unix(0, 0))); err != nil {
+			return err
+		}
+	}
+	return cursor.Err()
+}
+
+func (m *Mongo) cleanChunk(ctx context.Context, stream protocol.Stream, chunk types.Chunk) {
+	m.State.RemoveChunk(stream.Self(), chunk)
+}
+
+func (m *Mongo) fetchChunks(ctx context.Context, stream protocol.Stream, pool *protocol.WriterPool) ([]types.Chunk, error) {
 	collection := m.client.Database(stream.Namespace(), options.Database().SetReadConcern(readconcern.Majority())).Collection(stream.Name())
 	chunks := m.State.GetChunks(stream.Self())
 	var chunksArray []types.Chunk
+	// generate chunks or get from state
 	if chunks == nil || chunks.Len() == 0 {
 		// Full load case
 		logger.Infof("Starting full load for stream [%s]", stream.ID())
 
-		recordCount, err := m.totalCountInCollection(backfillCtx, collection)
+		recordCount, err := m.totalCountInCollection(ctx, collection)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if recordCount == 0 {
 			logger.Infof("Collection is empty, nothing to backfill")
-			return nil
+			return chunksArray, nil
 		}
 
 		logger.Infof("Total expected count for stream %s: %d", stream.ID(), recordCount)
@@ -44,11 +82,11 @@ func (m *Mongo) backfill(backfillCtx context.Context, pool *protocol.WriterPool,
 		// Generate and update chunks
 		var retryErr error
 		err = base.RetryOnBackoff(m.config.RetryCount, 1*time.Minute, func() error {
-			chunksArray, retryErr = m.splitChunks(backfillCtx, collection, stream)
+			chunksArray, retryErr = m.splitChunks(ctx, stream)
 			return retryErr
 		})
 		if err != nil {
-			return err
+			return nil, err
 		}
 		m.State.SetChunks(stream.Self(), types.NewSet(chunksArray...))
 	} else {
@@ -65,65 +103,52 @@ func (m *Mongo) backfill(backfillCtx context.Context, pool *protocol.WriterPool,
 			return chunksArray[i].Min.(*primitive.ObjectID).Hex() < chunksArray[j].Min.(*primitive.ObjectID).Hex()
 		})
 	}
-
-	logger.Infof("Running backfill for %d chunks", len(chunksArray))
-	// notice: err is declared in return, reason: defer call can access it
-	processChunk := func(ctx context.Context, chunk types.Chunk) (err error) {
-		errorChannel := make(chan error, 1)
-		insert, err := pool.NewThread(ctx, stream, protocol.WithErrorChannel(errorChannel), protocol.WithBackfill(true))
-		if err != nil {
-			return err
-		}
-		defer func() {
-			insert.Close()
-			if err == nil {
-				// wait for chunk completion
-				err = <-errorChannel
-			}
-		}()
-
-		opts := options.Aggregate().SetAllowDiskUse(true).SetBatchSize(int32(math.Pow10(6)))
-		cursorIterationFunc := func() error {
-			cursor, err := collection.Aggregate(ctx, generatePipeline(chunk.Min, chunk.Max), opts)
-			if err != nil {
-				return fmt.Errorf("collection.Find: %s", err)
-			}
-			defer cursor.Close(ctx)
-
-			for cursor.Next(ctx) {
-				var doc bson.M
-				if _, err = cursor.Current.LookupErr("_id"); err != nil {
-					return fmt.Errorf("looking up idProperty: %s", err)
-				} else if err = cursor.Decode(&doc); err != nil {
-					return fmt.Errorf("backfill decoding document: %s", err)
-				}
-
-				handleMongoObject(doc)
-				err := insert.Insert(types.CreateRawRecord(utils.GetKeysHash(doc, constants.MongoPrimaryID), doc, "r", time.Unix(0, 0)))
-				if err != nil {
-					return fmt.Errorf("failed to finish backfill chunk: %s", err)
-				}
-			}
-			return cursor.Err()
-		}
-		return base.RetryOnBackoff(m.config.RetryCount, 1*time.Minute, cursorIterationFunc)
-	}
-
-	utils.ConcurrentInGroup(protocol.GlobalConnGroup, chunksArray, func(ctx context.Context, chunk types.Chunk) error {
-		batchStartTime := time.Now()
-		err := processChunk(ctx, chunk)
-		if err != nil {
-			return err
-		}
-		// remove success chunk from state
-		m.State.RemoveChunk(stream.Self(), chunk)
-		logger.Infof("chunk with min[%v]-max[%v] completed in %0.2f seconds", chunk.Min, chunk.Max, time.Since(batchStartTime).Seconds())
-		return nil
-	})
-	return nil
+	return chunksArray, nil
 }
 
-func (m *Mongo) splitChunks(ctx context.Context, collection *mongo.Collection, stream protocol.Stream) ([]types.Chunk, error) {
+func (m *Mongo) processChunk(ctx context.Context, stream protocol.Stream, pool *protocol.WriterPool, chunk types.Chunk) error {
+	collection := m.client.Database(stream.Namespace(), options.Database().SetReadConcern(readconcern.Majority())).Collection(stream.Name())
+	errorChannel := make(chan error, 1)
+	insert, err := pool.NewThread(ctx, stream, protocol.WithErrorChannel(errorChannel), protocol.WithBackfill(true))
+	if err != nil {
+		return err
+	}
+	defer func() {
+		insert.Close()
+		if err == nil {
+			// wait for chunk completion
+			err = <-errorChannel
+		}
+	}()
+
+	opts := options.Aggregate().SetAllowDiskUse(true).SetBatchSize(int32(math.Pow10(6)))
+	cursorIterationFunc := func() error {
+		cursor, err := collection.Aggregate(ctx, generatePipeline(chunk.Min, chunk.Max), opts)
+		if err != nil {
+			return fmt.Errorf("collection.Find: %s", err)
+		}
+		defer cursor.Close(ctx)
+
+		for cursor.Next(ctx) {
+			var doc bson.M
+			if _, err = cursor.Current.LookupErr("_id"); err != nil {
+				return fmt.Errorf("looking up idProperty: %s", err)
+			} else if err = cursor.Decode(&doc); err != nil {
+				return fmt.Errorf("backfill decoding document: %s", err)
+			}
+
+			handleMongoObject(doc)
+			err := insert.Insert(types.CreateRawRecord(utils.GetKeysHash(doc, constants.MongoPrimaryID), doc, "r", time.Unix(0, 0)))
+			if err != nil {
+				return fmt.Errorf("failed to finish backfill chunk: %s", err)
+			}
+		}
+		return cursor.Err()
+	}
+	return base.RetryOnBackoff(m.config.RetryCount, 1*time.Minute, cursorIterationFunc)
+}
+func (m *Mongo) splitChunks(ctx context.Context, stream protocol.Stream) ([]types.Chunk, error) {
+	collection := m.client.Database(stream.Namespace()).Collection(stream.Name())
 	splitVectorStrategy := func() ([]types.Chunk, error) {
 		getID := func(order int) (primitive.ObjectID, error) {
 			var doc bson.M
